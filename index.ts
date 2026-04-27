@@ -19,20 +19,20 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
     name: "Umans Coder",
     reasoning: true,
     input: ["text", "image"],
-    contextWindow: 256000,
-    maxTokens: 65000,
+    contextWindow: 262144,
+    maxTokens: 32768,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek" },
   },
   {
     id: "umans-kimi-k2.5",
     name: "Umans Kimi K2.5",
     reasoning: true,
     input: ["text", "image"],
-    contextWindow: 256000,
-    maxTokens: 65000,
+    contextWindow: 262144,
+    maxTokens: 32768,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek" },
   },
   {
     id: "umans-kimi-k2.6",
@@ -40,19 +40,19 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
     reasoning: true,
     input: ["text", "image"],
     contextWindow: 262144,
-    maxTokens: 65000,
+    maxTokens: 32768,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek" },
   },
   {
     id: "umans-glm-5.1",
     name: "Umans GLM 5.1",
     reasoning: true,
     input: ["text"],
-    contextWindow: 204800,
+    contextWindow: 202752,
     maxTokens: 131072,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek" },
   },
   {
     id: "umans-minimax-m2.5",
@@ -60,9 +60,9 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
     reasoning: true,
     input: ["text"],
     contextWindow: 204800,
-    maxTokens: 131072,
+    maxTokens: 8192,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek" },
   },
 ];
 
@@ -85,7 +85,7 @@ function mapUmansModel(id: string, info: any): ProviderModelConfig {
     contextWindow: caps.context_window ?? 200000,
     maxTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek" },
   };
 }
 
@@ -125,7 +125,8 @@ async function loginUmans(
   if (!key.startsWith("sk-")) {
     throw new Error("Invalid API key: must start with 'sk-'");
   }
-  return { refresh: key, access: key, expires: 0 };
+  // API keys don't expire — use far-future timestamp to avoid unnecessary refresh attempts
+  return { refresh: key, access: key, expires: Date.now() + 100 * 365 * 24 * 60 * 60 * 1000 };
 }
 
 function refreshUmansToken(
@@ -249,11 +250,16 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // --- Inject thinking into requests ---
+  // PI handles thinking via thinkingFormat: "deepseek" → sends thinking: { type: "enabled"|"disabled" }
+  // based on user's /thinking level. The deepseek path also adds reasoning_effort alongside
+  // thinking — strip it since umans' upstream models (Kimi, GLM) only understand the thinking field.
   pi.on("before_provider_request", (event) => {
     const model: string = event.payload.model ?? "";
     if (!model.startsWith("umans-")) return;
-    return { ...event.payload, thinking: { type: "enabled" } };
+    if ("reasoning_effort" in event.payload) {
+      const { reasoning_effort: _, ...rest } = event.payload as any;
+      return rest;
+    }
   });
 
   // --- Status bar: usage + performance ---

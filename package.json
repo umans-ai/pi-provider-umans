@@ -1,6 +1,6 @@
 {
   "name": "pi-provider-umans",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Umans.ai provider for pi — OpenAI-compatible endpoint with dynamic model discovery",
   "type": "module",
   "main": "index.ts",
