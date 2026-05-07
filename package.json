@@ -21,12 +21,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/karutoil/pi-provider-umans.git"
+    "url": "git+https://github.com/umans-ai/pi-provider-umans.git"
   },
   "bugs": {
-    "url": "https://github.com/karutoil/pi-provider-umans/issues"
+    "url": "https://github.com/umans-ai/pi-provider-umans/issues"
   },
-  "homepage": "https://github.com/karutoil/pi-provider-umans#readme",
+  "homepage": "https://github.com/umans-ai/pi-provider-umans#readme",
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "echo 'nothing to build'",

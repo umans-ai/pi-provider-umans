@@ -1,21 +1,27 @@
-name: Auto Tag
+name: Release
 
 on:
   push:
     branches: [main, master]
 
 jobs:
-  auto-tag:
+  release:
     if: "!contains(github.event.head_commit.message, 'chore: bump version to')"
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
 
       - name: Determine next version
         id: version
@@ -25,7 +31,6 @@ jobs:
           LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
           echo "Latest tag: $LATEST_TAG"
 
-          # Check if there are commits since last tag
           if [ "$(git rev-list -n1 "$LATEST_TAG" 2>/dev/null || true)" = "$(git rev-parse HEAD)" ]; then
             echo "No new commits since $LATEST_TAG, skipping."
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -63,18 +68,26 @@ jobs:
 
       - name: Update package.json
         if: steps.version.outputs.skip != 'true'
-        run: |
-          npm version ${{ steps.version.outputs.new_version }} --no-git-tag-version
+        run: npm version ${{ steps.version.outputs.new_version }} --no-git-tag-version
 
-      - name: Commit version bump
+      - name: Commit version bump and tag
         if: steps.version.outputs.skip != 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: bump version to ${{ steps.version.outputs.new_tag }}"
           file_pattern: package.json
+          tagging_message: ${{ steps.version.outputs.new_tag }}
 
-      - name: Create and push tag
+      - name: Install dependencies
         if: steps.version.outputs.skip != 'true'
-        run: |
-          git tag "${{ steps.version.outputs.new_tag }}"
-          git push origin "${{ steps.version.outputs.new_tag }}"
+        run: npm install
+
+      - name: Build
+        if: steps.version.outputs.skip != 'true'
+        run: npm run build
+
+      - name: Publish to npm
+        if: steps.version.outputs.skip != 'true'
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
