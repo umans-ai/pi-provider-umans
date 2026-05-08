@@ -253,13 +253,81 @@ export default function (pi: ExtensionAPI) {
   // PI handles thinking via thinkingFormat: "deepseek" → sends thinking: { type: "enabled"|"disabled" }
   // based on user's /thinking level. The deepseek path also adds reasoning_effort alongside
   // thinking — strip it since umans' upstream models (Kimi, GLM) only understand the thinking field.
+  //
+  // Also sanitize conversation history: ensure every tool_calls entry has a matching
+  // tool result message. Context compaction can drop tool result messages while keeping
+  // the assistant message that made the tool call, causing a 400 error from the API:
+  //   "an assistant message with 'tool_calls' must be followed by tool messages
+  //    responding to each 'tool_call_id'"
   pi.on("before_provider_request", (event) => {
-    const model: string = event.payload.model ?? "";
+    const p = event.payload as Record<string, any>;
+    const model: string = p.model ?? "";
     if (!model.startsWith("umans-")) return;
-    if ("reasoning_effort" in event.payload) {
-      const { reasoning_effort: _, ...rest } = event.payload as any;
-      return rest;
+
+    // --- Strip reasoning_effort (upstream models don't support it) ---
+    if ("reasoning_effort" in p) {
+      const { reasoning_effort: _, ...rest } = p as any;
+      Object.assign(p, rest);
+      delete (p as any).reasoning_effort;
     }
+
+    // --- Sanitize orphaned tool_calls in OpenAI-format messages ---
+    const messages = p.messages;
+    if (!Array.isArray(messages) || messages.length === 0) return;
+
+    // Collect all tool_call IDs from assistant messages
+    const toolCallIds = new Set<string>();
+    for (const msg of messages) {
+      if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          if (tc.id) toolCallIds.add(tc.id);
+        }
+      }
+    }
+
+    // Collect all tool_call_ids from tool result messages
+    const toolResultIds = new Set<string>();
+    for (const msg of messages) {
+      if (msg.role === "tool" && msg.tool_call_id) {
+        toolResultIds.add(msg.tool_call_id);
+      }
+    }
+
+    // Find orphaned IDs (assistant made a tool_call but no tool result exists)
+    const orphanedIds = [...toolCallIds].filter((id) => !toolResultIds.has(id));
+    if (orphanedIds.length === 0) return;
+
+    console.warn(
+      `[pi-provider-umans] Found ${orphanedIds.length} orphaned tool_call(s) without tool result: ${orphanedIds.join(", ")}`,
+    );
+
+    // Insert synthetic tool result messages after the assistant message that made each call
+    const newMessages = [...messages];
+    let insertOffset = 0;
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role !== "assistant" || !Array.isArray(msg.tool_calls)) continue;
+
+      const orphanedCalls = msg.tool_calls.filter((tc: any) =>
+        orphanedIds.includes(tc.id),
+      );
+      if (orphanedCalls.length === 0) continue;
+
+      // Insert synthetic tool results right after this assistant message
+      const insertIdx = i + insertOffset + 1;
+      const syntheticResults = orphanedCalls.map((tc: any) => ({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: "[tool result was lost during context compaction]",
+      }));
+
+      newMessages.splice(insertIdx, 0, ...syntheticResults);
+      insertOffset += orphanedCalls.length;
+    }
+
+    p.messages = newMessages;
+    return p;
   });
 
   // --- Status bar: usage + performance ---
