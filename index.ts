@@ -250,6 +250,9 @@ export default function (pi: ExtensionAPI) {
   // result messages, the orphaned tool_use blocks cause a 400 error.
   pi.on("before_provider_request", async (event, _ctx) => {
     const p = event.payload as Record<string, any>;
+    const model = p?.model ?? "";
+    if (!model.startsWith("umans-")) return;
+
     const messages = p?.messages;
     let orphanedIds: string[] = [];
     if (Array.isArray(messages) && messages.length > 0) {
@@ -335,20 +338,7 @@ export default function (pi: ExtensionAPI) {
         p.messages = patchedMessages;
       }
     }
-
-    // --- Fix thinking param for non-Claude models ---
-    // NOTE: if we patched messages above, we must return the payload so the
-    // mutation takes effect (some Pi versions copy the payload before sending).
-    const model = p?.model ?? "";
-    if (!model.includes("qwen") && !model.includes("flash")) return;
-    if (p.thinking && p.thinking.type === "enabled") {
-      // Remove budget_tokens for non-Claude models (they don't support it)
-      delete p.thinking.budget_tokens;
-      return p;
-    }
   });
-
-
 
   // --- Status bar: usage + performance ---
   let turnStartTime = 0;
