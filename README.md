@@ -1,6 +1,6 @@
 # pi-provider-umans
 
-[Umans.ai](https://umans.ai) provider for [pi](https://shittycodingagent.ai) — drop-in OpenAI-compatible endpoint with **dynamic model discovery**.
+[Umans.ai](https://umans.ai) provider for [pi](https://shittycodingagent.ai) — drop-in Anthropic Messages-compatible endpoint with **dynamic model discovery**.
 
 ## Install
 
