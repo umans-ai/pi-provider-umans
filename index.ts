@@ -22,7 +22,6 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
     contextWindow: 262144,
     maxTokens: 32768,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek", requiresReasoningContentOnAssistantMessages: true },
   },
   {
     id: "umans-kimi-k2.5",
@@ -32,7 +31,6 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
     contextWindow: 262144,
     maxTokens: 32768,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek", requiresReasoningContentOnAssistantMessages: true },
   },
   {
     id: "umans-kimi-k2.6",
@@ -42,7 +40,6 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
     contextWindow: 262144,
     maxTokens: 32768,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek", requiresReasoningContentOnAssistantMessages: true },
   },
   {
     id: "umans-glm-5.1",
@@ -52,7 +49,6 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
     contextWindow: 202752,
     maxTokens: 131072,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek", requiresReasoningContentOnAssistantMessages: true },
   },
   {
     id: "umans-minimax-m2.5",
@@ -62,7 +58,6 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
     contextWindow: 204800,
     maxTokens: 8192,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek", requiresReasoningContentOnAssistantMessages: true },
   },
 ];
 
@@ -76,7 +71,6 @@ function mapUmansModel(id: string, info: any): ProviderModelConfig {
     typeof recommendedMax === "number" && recommendedMax >= 8192
       ? recommendedMax
       : 65000;
-
   return {
     id,
     name: info.display_name || id,
@@ -85,7 +79,6 @@ function mapUmansModel(id: string, info: any): ProviderModelConfig {
     contextWindow: caps.context_window ?? 200000,
     maxTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "deepseek", requiresReasoningContentOnAssistantMessages: true },
   };
 }
 
@@ -191,12 +184,6 @@ async function fetchUsage(apiKey: string): Promise<UsageData | null> {
 // Status bar
 // ---------------------------------------------------------------------------
 
-function fmtNum(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
-}
-
 function fmtDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
@@ -237,8 +224,8 @@ async function updateUsageStatus(ctx: any, tps?: string, ttft?: string): Promise
 export default function (pi: ExtensionAPI) {
   // --- Provider registration ---
   pi.registerProvider("umans", {
-    baseUrl: "https://api.code.umans.ai/v1",
-    api: "openai-completions",
+    baseUrl: "https://api.code.umans.ai",
+    api: "anthropic-messages",
     apiKey: "UMANS_API_KEY",
     authHeader: true,
     models,
@@ -250,85 +237,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // PI handles thinking via thinkingFormat: "deepseek" → sends thinking: { type: "enabled"|"disabled" }
-  // based on user's /thinking level. The deepseek path also adds reasoning_effort alongside
-  // thinking — strip it since umans' upstream models (Kimi, GLM) only understand the thinking field.
-  //
-  // Also sanitize conversation history: ensure every tool_calls entry has a matching
-  // tool result message. Context compaction can drop tool result messages while keeping
-  // the assistant message that made the tool call, causing a 400 error from the API:
-  //   "an assistant message with 'tool_calls' must be followed by tool messages
-  //    responding to each 'tool_call_id'"
-  pi.on("before_provider_request", (event) => {
-    const p = event.payload as Record<string, any>;
-    const model: string = p.model ?? "";
-    if (!model.startsWith("umans-")) return;
-
-    // --- Strip reasoning_effort (upstream models don't support it) ---
-    if ("reasoning_effort" in p) {
-      const { reasoning_effort: _, ...rest } = p as any;
-      Object.assign(p, rest);
-      delete (p as any).reasoning_effort;
-    }
-
-    // --- Sanitize orphaned tool_calls in OpenAI-format messages ---
-    const messages = p.messages;
-    if (!Array.isArray(messages) || messages.length === 0) return;
-
-    // Collect all tool_call IDs from assistant messages
-    const toolCallIds = new Set<string>();
-    for (const msg of messages) {
-      if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
-        for (const tc of msg.tool_calls) {
-          if (tc.id) toolCallIds.add(tc.id);
-        }
-      }
-    }
-
-    // Collect all tool_call_ids from tool result messages
-    const toolResultIds = new Set<string>();
-    for (const msg of messages) {
-      if (msg.role === "tool" && msg.tool_call_id) {
-        toolResultIds.add(msg.tool_call_id);
-      }
-    }
-
-    // Find orphaned IDs (assistant made a tool_call but no tool result exists)
-    const orphanedIds = [...toolCallIds].filter((id) => !toolResultIds.has(id));
-    if (orphanedIds.length === 0) return;
-
-    console.warn(
-      `[pi-provider-umans] Found ${orphanedIds.length} orphaned tool_call(s) without tool result: ${orphanedIds.join(", ")}`,
-    );
-
-    // Insert synthetic tool result messages after the assistant message that made each call
-    const newMessages = [...messages];
-    let insertOffset = 0;
-
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-      if (msg.role !== "assistant" || !Array.isArray(msg.tool_calls)) continue;
-
-      const orphanedCalls = msg.tool_calls.filter((tc: any) =>
-        orphanedIds.includes(tc.id),
-      );
-      if (orphanedCalls.length === 0) continue;
-
-      // Insert synthetic tool results right after this assistant message
-      const insertIdx = i + insertOffset + 1;
-      const syntheticResults = orphanedCalls.map((tc: any) => ({
-        role: "tool",
-        tool_call_id: tc.id,
-        content: "[tool result was lost during context compaction]",
-      }));
-
-      newMessages.splice(insertIdx, 0, ...syntheticResults);
-      insertOffset += orphanedCalls.length;
-    }
-
-    p.messages = newMessages;
-    return p;
-  });
+  // pi-ai's transform-messages.js already inserts synthetic tool_result entries
+  // for orphaned tool_use blocks before this hook fires (see AnthropicMessagesCompat
+  // and transform-messages.js). No manual repair needed.
 
   // --- Status bar: usage + performance ---
   let turnStartTime = 0;
