@@ -19,6 +19,7 @@
  *   # then /model umans/umans-coder
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 
 type ReasoningInfo = {
   supported: boolean;
@@ -47,6 +48,7 @@ type UmansModelInfo = {
 const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const API_KEY_ENV = "UMANS_API_KEY";
 const USER_AGENT = "pi-umans-provider/1.2.5";
+const STATUS_UPDATE_INTERVAL_MS = 1000;
 
 // Static fallback when /v1/models/info cannot be reached. Keep in sync with the
 // public model list from https://api.code.umans.ai/v1/models
@@ -304,12 +306,44 @@ export default async function (pi: ExtensionAPI) {
     throw new Error("Umans provider: no models available from gateway or fallback");
   }
 
+  async function loginUmans(
+    callbacks: OAuthLoginCallbacks,
+  ): Promise<OAuthCredentials> {
+    const apiKey = await callbacks.onPrompt({
+      message: "Enter your Umans API key:",
+    });
+    const key = apiKey.trim();
+    if (!key) throw new Error("Umans API key is required");
+    return {
+      refresh: key,
+      access: key,
+      expires: Date.now() + 100 * 365 * 24 * 60 * 60 * 1000,
+    };
+  }
+
+  function refreshUmansToken(
+    credentials: OAuthCredentials,
+  ): Promise<OAuthCredentials> {
+    return Promise.resolve(credentials);
+  }
+
+  function getApiKey(credentials: OAuthCredentials): string {
+    return credentials.access;
+  }
+
   pi.registerProvider("umans", {
     name: "Umans",
     baseUrl,
     apiKey: `$${API_KEY_ENV}`,
     api: "anthropic-messages",
+    authHeader: true,
     models,
+    oauth: {
+      name: "Umans",
+      login: loginUmans,
+      refreshToken: refreshUmansToken,
+      getApiKey,
+    },
   });
 
   // === Status bar: TTFT | TPS | Conc current/guaranteed ===
@@ -324,8 +358,9 @@ export default async function (pi: ExtensionAPI) {
     estimatedTokens: number;
     lastStatusUpdate: number;
   };
-  const liveRequests = new Map<string, LiveRequest>();
   let activeTurns = 0;
+  let liveRequest: LiveRequest | undefined;
+  let lastMetrics: { ttft?: number; tps?: number } = {};
 
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let refreshStopped = false;
@@ -352,30 +387,51 @@ export default async function (pi: ExtensionAPI) {
     }, 5000);
   }
 
+  function computeCumulativeTps(req: LiveRequest, now: number): number {
+    if (!req.firstTokenTime || req.estimatedTokens <= 0) return 0;
+    const elapsedSec = (now - req.firstTokenTime) / 1000;
+    // Wait a moment so a tiny first chunk does not create a wild initial value.
+    if (elapsedSec < 0.5) return 0;
+    return Math.round(req.estimatedTokens / elapsedSec);
+  }
+
   function statusText(metrics?: { ttft?: number; tps?: number }) {
     const parts: string[] = [];
     if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
-    if (metrics?.tps !== undefined && activeTurns > 0) parts.push(`TPS ${metrics.tps}`);
+    if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
     const guaranteed = guaranteedConcurrency !== undefined ? String(guaranteedConcurrency) : "?";
     parts.push(`Conc ${activeTurns}/${guaranteed}`);
+    // Only show request usage when the plan has a hard limit (e.g. the $20 tier).
     if (requestsUsed !== undefined && requestLimit !== undefined) {
       parts.push(`Req ${requestsUsed}/${requestLimit}`);
-    } else if (requestsUsed !== undefined) {
-      parts.push(`Req ${requestsUsed}`);
     }
-    return `umans ${parts.join(" | ")}`;
+    return `Umans ${parts.join(" │ ")}`;
   }
 
-  function setStatus(ctx: any, text?: string) {
+  function setWidget(ctx: any, text?: string) {
     try {
-      ctx.ui.setStatus(STATUS_KEY, text);
+      ctx.ui.setWidget(
+        STATUS_KEY,
+        text ? [ctx.ui.theme.fg("dim", text)] : undefined,
+        { placement: "belowEditor" },
+      );
     } catch {
       // UI may not be available in all modes; ignore.
     }
   }
 
   function updateStatus(ctx: any, metrics?: { ttft?: number; tps?: number }) {
-    setStatus(ctx, statusText(metrics));
+    if (metrics) {
+      // TTFT is tied to the current response; update it when provided.
+      if (metrics.ttft !== undefined) lastMetrics.ttft = metrics.ttft;
+      // Keep the last non-zero TPS so the display does not flash 0 during
+      // tool-call gaps or tiny response tails. It resets only when the user
+      // switches away from Umans or the session shuts down.
+      if (metrics.tps !== undefined && metrics.tps > 0) {
+        lastMetrics.tps = metrics.tps;
+      }
+    }
+    setWidget(ctx, statusText(lastMetrics));
   }
 
   async function refreshUsage(apiKey: string) {
@@ -412,8 +468,18 @@ export default async function (pi: ExtensionAPI) {
     return (msg?.provider ?? ctx.model?.provider) === "umans";
   }
 
+  async function resolveApiKey(ctx?: any): Promise<string | undefined> {
+    const envKey = process.env[API_KEY_ENV]?.trim();
+    if (envKey) return envKey;
+    try {
+      return await ctx?.modelRegistry?.getApiKeyForProvider("umans");
+    } catch {
+      return undefined;
+    }
+  }
+
   pi.on("session_start", async (_event, ctx) => {
-    const apiKey = process.env[API_KEY_ENV]?.trim();
+    const apiKey = await resolveApiKey(ctx);
     if (ctx.model?.provider === "umans") {
       if (apiKey) await refreshUsage(apiKey);
       restartRefreshLoop(apiKey || "");
@@ -425,13 +491,14 @@ export default async function (pi: ExtensionAPI) {
     const provider = event.model.provider;
     if (provider !== "umans") {
       stopRefreshLoop();
-      setStatus(ctx, undefined);
+      setWidget(ctx, undefined);
       activeTurns = 0;
-      liveRequests.clear();
+      liveRequest = undefined;
+      lastMetrics = {};
       return;
     }
     updateStatus(ctx);
-    const apiKey = process.env[API_KEY_ENV]?.trim();
+    const apiKey = await resolveApiKey(ctx);
     if (apiKey) await refreshUsage(apiKey);
     restartRefreshLoop(apiKey || "");
   });
@@ -455,15 +522,13 @@ export default async function (pi: ExtensionAPI) {
     if (ctx.model?.provider !== "umans") return;
     const msg = event.message as any;
     if (msg?.role !== "assistant") return;
-    const id = msg.id || (msg.id = `umans-${Date.now()}-${Math.random()}`);
-    liveRequests.set(id, { startTime: Date.now(), estimatedTokens: 0, lastStatusUpdate: 0 });
+    liveRequest = { startTime: Date.now(), estimatedTokens: 0, lastStatusUpdate: 0 };
     updateStatus(ctx);
   });
 
   pi.on("message_update", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
-    const id = (event.message as any).id;
-    const req = liveRequests.get(id);
+    const req = liveRequest;
     if (!req) return;
     const now = Date.now();
     const ev = event.assistantMessageEvent as any;
@@ -475,8 +540,8 @@ export default async function (pi: ExtensionAPI) {
       if (!req.firstTokenTime) req.firstTokenTime = now;
       req.estimatedTokens += Math.max(1, Math.round(delta.length / 4));
       const elapsedSec = req.firstTokenTime ? (now - req.firstTokenTime) / 1000 : 0;
-      if (elapsedSec > 0 && now - req.lastStatusUpdate > 150) {
-        const tps = Math.round(req.estimatedTokens / elapsedSec);
+      if (elapsedSec > 0 && now - req.lastStatusUpdate > STATUS_UPDATE_INTERVAL_MS) {
+        const tps = computeCumulativeTps(req, now);
         updateStatus(ctx, { tps, ttft: req.firstTokenTime - req.startTime });
         req.lastStatusUpdate = now;
       }
@@ -487,18 +552,15 @@ export default async function (pi: ExtensionAPI) {
     const msg = event.message as any;
     if (!isActiveUmans(ctx, msg)) return;
     if (msg?.role !== "assistant") return;
-    const id = msg.id;
-    const req = liveRequests.get(id);
+    const req = liveRequest;
     let ttft: number | undefined;
     let tps: number | undefined;
     if (req) {
       ttft = req.firstTokenTime ? req.firstTokenTime - req.startTime : undefined;
-      const outputTokens = typeof msg.usage?.output === "number" ? msg.usage.output : undefined;
-      if (outputTokens && req.firstTokenTime) {
-        const elapsedSec = (Date.now() - req.firstTokenTime) / 1000;
-        if (elapsedSec > 0) tps = Math.round(outputTokens / elapsedSec);
-      }
-      liveRequests.delete(id);
+      // Compute final TPS from the cumulative live count, excluding tool-call
+      // JSON so a big tool argument dump does not spike TPS.
+      tps = computeCumulativeTps(req, Date.now());
+      liveRequest = undefined;
     }
     updateStatus(ctx, { ttft, tps });
   });
@@ -508,15 +570,16 @@ export default async function (pi: ExtensionAPI) {
   pi.on("agent_end", async (_event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
     activeTurns = 0;
-    liveRequests.clear();
+    liveRequest = undefined;
     updateStatus(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     stopRefreshLoop();
     activeTurns = 0;
-    liveRequests.clear();
-    setStatus(ctx, undefined);
+    liveRequest = undefined;
+    lastMetrics = {};
+    setWidget(ctx, undefined);
   });
 
 }
