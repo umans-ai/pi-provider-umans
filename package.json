@@ -30,7 +30,10 @@
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "echo 'nothing to build'",
-    "check": "echo 'nothing to check'"
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.7"
   },
   "pi": {
     "extensions": [

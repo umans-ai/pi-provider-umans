@@ -46,7 +46,7 @@ type UmansModelInfo = {
 
 const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const API_KEY_ENV = "UMANS_API_KEY";
-const USER_AGENT = "pi-umans-provider/1.0.0";
+const USER_AGENT = "pi-umans-provider/1.2.5";
 
 // Static fallback when /v1/models/info cannot be reached. Keep in sync with the
 // public model list from https://api.code.umans.ai/v1/models
@@ -178,12 +178,12 @@ const STATIC_CATALOG: Record<string, UmansModelInfo> = {
  */
 function safeMaxTokens(recommended?: number, cap?: number): number {
   const fallback = 32768;
-  const value =
+  let value =
     typeof recommended === "number" && recommended > 0 ? recommended : fallback;
   if (typeof cap === "number" && cap > 0) {
-    return Math.min(value, cap - 1);
+    value = Math.min(value, cap - 1);
   }
-  return value;
+  return Math.max(value, 1);
 }
 
 /**
@@ -257,7 +257,7 @@ async function fetchModelCatalog(
   }
 }
 export default async function (pi: ExtensionAPI) {
-  if (process.env.UMANS_DISABLE) return;
+  if (process.env.UMANS_DISABLE === "1") return;
 
   const baseUrl =
     process.env.UMANS_BASE_URL?.trim().replace(/\/$/, "") || DEFAULT_BASE_URL;
@@ -317,7 +317,6 @@ export default async function (pi: ExtensionAPI) {
   let guaranteedConcurrency: number | undefined;
   let requestLimit: number | undefined;
   let requestsUsed: number | undefined;
-  let currentProvider = "";
 
   type LiveRequest = {
     startTime: number;
@@ -327,6 +326,31 @@ export default async function (pi: ExtensionAPI) {
   };
   const liveRequests = new Map<string, LiveRequest>();
   let activeTurns = 0;
+
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let refreshStopped = false;
+
+  function stopRefreshLoop() {
+    refreshStopped = true;
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = undefined;
+    }
+  }
+
+  function restartRefreshLoop(apiKey: string) {
+    stopRefreshLoop();
+    refreshStopped = false;
+    scheduleRefresh(apiKey);
+  }
+
+  function scheduleRefresh(apiKey: string) {
+    if (refreshStopped || !apiKey) return;
+    refreshTimer = setTimeout(async () => {
+      await refreshUsage(apiKey);
+      scheduleRefresh(apiKey);
+    }, 5000);
+  }
 
   function statusText(metrics?: { ttft?: number; tps?: number }) {
     const parts: string[] = [];
@@ -342,13 +366,24 @@ export default async function (pi: ExtensionAPI) {
     return `umans ${parts.join(" | ")}`;
   }
 
+  function setStatus(ctx: any, text?: string) {
+    try {
+      ctx.ui.setStatus(STATUS_KEY, text);
+    } catch {
+      // UI may not be available in all modes; ignore.
+    }
+  }
+
   function updateStatus(ctx: any, metrics?: { ttft?: number; tps?: number }) {
-    ctx.ui.setStatus(STATUS_KEY, statusText(metrics));
+    setStatus(ctx, statusText(metrics));
   }
 
   async function refreshUsage(apiKey: string) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
     try {
       const res = await fetch(`${baseUrl}/v1/usage`, {
+        signal: ctrl.signal,
         headers: {
           Authorization: `Bearer ${apiKey}`,
           Accept: "application/json",
@@ -368,6 +403,8 @@ export default async function (pi: ExtensionAPI) {
       requestsUsed = data.usage?.requests_in_window ?? data.usage?.concurrent_sessions;
     } catch {
       // Leave as undefined; status bar will show "?".
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -377,14 +414,18 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     const apiKey = process.env[API_KEY_ENV]?.trim();
-    if (apiKey) await refreshUsage(apiKey);
-    if (ctx.model?.provider === "umans") updateStatus(ctx);
+    if (ctx.model?.provider === "umans") {
+      if (apiKey) await refreshUsage(apiKey);
+      restartRefreshLoop(apiKey || "");
+      updateStatus(ctx);
+    }
   });
 
   pi.on("model_select", async (event, ctx) => {
-    currentProvider = event.model.provider;
-    if (currentProvider !== "umans") {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
+    const provider = event.model.provider;
+    if (provider !== "umans") {
+      stopRefreshLoop();
+      setStatus(ctx, undefined);
       activeTurns = 0;
       liveRequests.clear();
       return;
@@ -392,6 +433,7 @@ export default async function (pi: ExtensionAPI) {
     updateStatus(ctx);
     const apiKey = process.env[API_KEY_ENV]?.trim();
     if (apiKey) await refreshUsage(apiKey);
+    restartRefreshLoop(apiKey || "");
   });
 
   // Track active provider turns for the concurrency counter. A turn maps to one
@@ -413,7 +455,7 @@ export default async function (pi: ExtensionAPI) {
     if (ctx.model?.provider !== "umans") return;
     const msg = event.message as any;
     if (msg?.role !== "assistant") return;
-    const id = msg.id || `umans-${Date.now()}-${Math.random()}`;
+    const id = msg.id || (msg.id = `umans-${Date.now()}-${Math.random()}`);
     liveRequests.set(id, { startTime: Date.now(), estimatedTokens: 0, lastStatusUpdate: 0 });
     updateStatus(ctx);
   });
@@ -471,18 +513,12 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+    stopRefreshLoop();
+    activeTurns = 0;
+    liveRequests.clear();
+    setStatus(ctx, undefined);
   });
 
-  // Refresh usage stats every 5s in TUI/RPC to keep the guaranteed limit current.
-  const apiKey = process.env[API_KEY_ENV]?.trim();
-  if (apiKey) {
-    const loop = async () => {
-      await refreshUsage(apiKey);
-      setTimeout(loop, 5000);
-    };
-    loop();
-  }
 }
 
 

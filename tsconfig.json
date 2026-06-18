@@ -9,13 +9,7 @@
     "skipLibCheck": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "types": [],
-    "paths": {
-      "@earendil-works/pi-coding-agent": ["/home/karutoil/.bun/install/global/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"],
-      "@earendil-works/pi-ai": ["/home/karutoil/.bun/install/global/node_modules/@earendil-works/pi-ai/dist/index.d.ts"],
-      "@earendil-works/pi-agent-core": ["/home/karutoil/.bun/install/global/node_modules/@earendil-works/pi-agent-core/dist/index.d.ts"],
-      "@earendil-works/pi-tui": ["/home/karutoil/.bun/install/global/node_modules/@earendil-works/pi-tui/dist/index.d.ts"]
-    }
+    "types": []
   },
   "include": ["index.ts"]
 }
