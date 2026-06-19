@@ -298,6 +298,14 @@ export default async function (pi: ExtensionAPI) {
           // Force adaptive by default; UMANS_BUDGET_THINKING=1 opts into legacy
           // budget-based thinking.
           forceAdaptiveThinking: reasoning?.supported && !useBudgetThinking,
+          // Adaptive thinking returns thinking blocks with NO valid signature.
+          // pi's default converts unsigned prior thinking to plain text on the next
+          // turn, which corrupts context: the model echoes it as
+          // `[Thinking from previous turn]`, the marker stacks each turn, and any
+          // junk directive locks in (observed degrading a long helpdesk build until
+          // thinking collapsed to just the marker). Preserve the thinking block with
+          // an empty signature instead — Umans accepts empty-signature thinking.
+          allowEmptySignature: true,
         },
       };
     });
@@ -349,6 +357,7 @@ export default async function (pi: ExtensionAPI) {
   // === Status bar: TTFT | TPS | Conc current/guaranteed ===
   const STATUS_KEY = "umans";
   let guaranteedConcurrency: number | undefined;
+  let currentConcurrency: number | undefined;
   let requestLimit: number | undefined;
   let requestsUsed: number | undefined;
 
@@ -400,7 +409,15 @@ export default async function (pi: ExtensionAPI) {
     if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
     if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
     const guaranteed = guaranteedConcurrency !== undefined ? String(guaranteedConcurrency) : "?";
-    parts.push(`Conc ${activeTurns}/${guaranteed}`);
+    // Account-wide conc from /v1/usage (includes other clients, not just this
+    // pi instance). Floor with local active turns so the counter ticks on a
+    // turn boundary before the next poll reflects it; ponytail: can overstate
+    // if local turns don't map 1:1 to gateway sessions — drop the max if so.
+    const current =
+      currentConcurrency !== undefined
+        ? String(Math.max(currentConcurrency, activeTurns))
+        : activeTurns > 0 ? String(activeTurns) : "?";
+    parts.push(`Conc ${current}/${guaranteed}`);
     // Only show request usage when the plan has a hard limit (e.g. the $20 tier).
     if (requestsUsed !== undefined && requestLimit !== undefined) {
       parts.push(`Req ${requestsUsed}/${requestLimit}`);
@@ -454,9 +471,12 @@ export default async function (pi: ExtensionAPI) {
         };
         usage?: { requests_in_window?: number; concurrent_sessions?: number };
       };
-      guaranteedConcurrency = data.limits?.concurrency?.limit;
-      requestLimit = data.limits?.requests?.limit;
-      requestsUsed = data.usage?.requests_in_window ?? data.usage?.concurrent_sessions;
+      // null ?? undefined normalizes unlimited (null) limits so the display
+      // guards below hide them instead of rendering "x/null".
+      guaranteedConcurrency = data.limits?.concurrency?.limit ?? undefined;
+      currentConcurrency = data.usage?.concurrent_sessions;
+      requestLimit = data.limits?.requests?.limit ?? undefined;
+      requestsUsed = data.usage?.requests_in_window;
     } catch {
       // Leave as undefined; status bar will show "?".
     } finally {
@@ -503,11 +523,12 @@ export default async function (pi: ExtensionAPI) {
     restartRefreshLoop(apiKey || "");
   });
 
-  // Track active provider turns for the concurrency counter. A turn maps to one
-  // gateway request, so this is the most reliable signal for "current concurrency".
-  pi.on("turn_start", async (_event, ctx) => {
+  // turn_start opens the TTFT clock: it fires before API-key/HTTP/prefill, so TTFT
+  // spans the full send→first-token gap, not just the stream body from message_start.
+  pi.on("turn_start", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
     activeTurns++;
+    liveRequest = { startTime: event.timestamp, estimatedTokens: 0, lastStatusUpdate: 0 };
     updateStatus(ctx);
   });
 
@@ -516,16 +537,6 @@ export default async function (pi: ExtensionAPI) {
     activeTurns = Math.max(0, activeTurns - 1);
     updateStatus(ctx);
   });
-
-  // Track per-message latency and throughput for TTFT/TPS.
-  pi.on("message_start", async (event, ctx) => {
-    if (ctx.model?.provider !== "umans") return;
-    const msg = event.message as any;
-    if (msg?.role !== "assistant") return;
-    liveRequest = { startTime: Date.now(), estimatedTokens: 0, lastStatusUpdate: 0 };
-    updateStatus(ctx);
-  });
-
   pi.on("message_update", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
     const req = liveRequest;
