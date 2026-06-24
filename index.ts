@@ -61,6 +61,47 @@ const FALLBACK_MODELS: ProviderModelConfig[] = [
   },
 ];
 
+/**
+ * Build reasoning config from the Umans `/models/info` capability payload.
+ *
+ * Umans advertises per-model `reasoning.levels` (e.g. GLM 5.2: ["none","high","max"]).
+ * pi thinking levels map onto those Umans effort values:
+ *   pi "off"    -> thinking disabled (model advertises "none")
+ *   pi "xhigh"  -> Umans "max"        (maximum reasoning)
+ *   minimal/low/medium/high -> same name when advertised, else hidden from the menu.
+ *
+ * Level-capable models use adaptive thinking (`forceAdaptiveThinking`) so pi sends
+ *   thinking: { type: "adaptive" } + output_config: { effort: "<level>" }
+ * Verified against the live Umans Anthropic endpoint: effort high/max are accepted
+ * (effort="max" yields the most reasoning), and thinking:{type:"disabled"} turns
+ * reasoning off. The endpoint also emits empty thinking signatures (signature:null),
+ * so `allowEmptySignature` preserves them on replay instead of degrading prior
+ * thinking to plain text across turns.
+ *
+ * Models with no advertised levels (e.g. Kimi, `levels: []`) are on/off only and keep
+ * pi's default budget-based thinking (no map, xhigh stays hidden — unchanged).
+ */
+function buildReasoningConfig(reasoning: any): {
+  thinkingLevelMap?: ProviderModelConfig["thinkingLevelMap"];
+  compat?: ProviderModelConfig["compat"];
+} {
+  const levels: string[] = Array.isArray(reasoning?.levels) ? reasoning.levels : [];
+  if (levels.length === 0) return {};
+  const canDisable = reasoning?.can_disable !== false;
+  const has = (v: string) => levels.includes(v);
+  return {
+    thinkingLevelMap: {
+      off: has("none") && canDisable ? "none" : null,
+      minimal: null, // Umans has no "minimal" tier
+      low: has("low") ? "low" : null,
+      medium: has("medium") ? "medium" : null,
+      high: has("high") ? "high" : null,
+      xhigh: has("max") ? "max" : null,
+    },
+    compat: { forceAdaptiveThinking: true, allowEmptySignature: true },
+  };
+}
+
 function mapUmansModel(id: string, info: any): ProviderModelConfig {
   const caps = info.capabilities ?? {};
   const supportsVision = caps.supports_vision === true;
@@ -71,6 +112,9 @@ function mapUmansModel(id: string, info: any): ProviderModelConfig {
     typeof recommendedMax === "number" && recommendedMax >= 8192
       ? recommendedMax
       : 65000;
+
+  const { thinkingLevelMap, compat } = buildReasoningConfig(caps.reasoning);
+
   return {
     id,
     name: info.display_name || id,
@@ -79,6 +123,8 @@ function mapUmansModel(id: string, info: any): ProviderModelConfig {
     contextWindow: caps.context_window ?? 200000,
     maxTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    thinkingLevelMap,
+    ...(compat ? { compat } : {}),
   };
 }
 
