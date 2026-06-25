@@ -488,7 +488,6 @@ export default async function (pi: ExtensionAPI) {
     estimatedTokens: number;
     lastStatusUpdate: number;
   };
-  let activeTurns = 0;
   let liveRequest: LiveRequest | undefined;
   let lastMetrics: { ttft?: number; tps?: number } = {};
 
@@ -530,14 +529,10 @@ export default async function (pi: ExtensionAPI) {
     if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
     if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
     const guaranteed = guaranteedConcurrency !== undefined ? String(guaranteedConcurrency) : "?";
-    // Account-wide conc from /v1/usage (includes other clients, not just this
-    // pi instance). Floor with local active turns so the counter ticks on a
-    // turn boundary before the next poll reflects it; ponytail: can overstate
-    // if local turns don't map 1:1 to gateway sessions — drop the max if so.
-    const current =
-      currentConcurrency !== undefined
-        ? String(Math.max(currentConcurrency, activeTurns))
-        : activeTurns > 0 ? String(activeTurns) : "?";
+    // Real account-wide conc from /v1/usage (includes other clients, not just
+    // this pi instance). Refreshed only by the 5s poll; shows "?" until first
+    // poll lands — never locally synthesized from sent-message turn counts.
+    const current = currentConcurrency !== undefined ? String(currentConcurrency) : "?";
     parts.push(`Conc ${current}/${guaranteed}`);
     // Only show request usage when the plan has a hard limit (e.g. the $20 tier).
     if (requestsUsed !== undefined && requestLimit !== undefined) {
@@ -785,6 +780,11 @@ export default async function (pi: ExtensionAPI) {
       const apiKey = await resolveApiKey(ctx);
       // ponytail: no key — leave the image; the text-model call fails anyway.
       if (!apiKey) return;
+      const imageCount = content.filter((b: any) => b?.type === "image").length;
+      ctx.ui?.notify?.(
+        `Umans vision handoff: analyzing ${imageCount} image${imageCount > 1 ? "s" : ""} with ${visionModelId}`,
+        "info",
+      );
       try {
         const transformed = await transformMessageImages(msg, apiKey, ctx);
         if (transformed) return { message: transformed };
@@ -871,7 +871,6 @@ export default async function (pi: ExtensionAPI) {
     if (provider !== "umans") {
       stopRefreshLoop();
       setWidget(ctx, undefined);
-      activeTurns = 0;
       liveRequest = undefined;
       lastMetrics = {};
       return;
@@ -886,14 +885,12 @@ export default async function (pi: ExtensionAPI) {
   // spans the full send→first-token gap, not just the stream body from message_start.
   pi.on("turn_start", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
-    activeTurns++;
     liveRequest = { startTime: event.timestamp, estimatedTokens: 0, lastStatusUpdate: 0 };
     updateStatus(ctx);
   });
 
   pi.on("turn_end", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
-    activeTurns = Math.max(0, activeTurns - 1);
     updateStatus(ctx);
   });
   pi.on("message_update", async (event, ctx) => {
@@ -939,14 +936,12 @@ export default async function (pi: ExtensionAPI) {
   // reset counters so the status bar never stays inflated.
   pi.on("agent_end", async (_event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
-    activeTurns = 0;
     liveRequest = undefined;
     updateStatus(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     stopRefreshLoop();
-    activeTurns = 0;
     liveRequest = undefined;
     lastMetrics = {};
     imageStore.clear();
