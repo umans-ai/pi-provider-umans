@@ -1,6 +1,6 @@
 {
   "name": "pi-provider-umans",
-  "version": "1.2.5",
+  "version": "1.2.7",
   "description": "Umans.ai provider for pi — Anthropic Messages-compatible endpoint with dynamic model discovery",
   "type": "module",
   "main": "index.ts",
