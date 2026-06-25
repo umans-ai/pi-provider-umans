@@ -9,6 +9,15 @@
  *   UMANS_BASE_URL         - override gateway base URL (default: https://api.code.umans.ai)
  *   UMANS_BUDGET_THINKING  - "1" opts out of adaptive (effort-level) thinking into legacy budget-based thinking
  *   UMANS_DISABLE          - "1" disables the extension entirely
+ *   UMANS_VISION_DISABLE   - "1" seeds vision handoff off (toggle live with /umans-vision)
+ *   UMANS_VISION_MODEL     - seeds the vision model id (default: umans-kimi-k2.7, or first
+ *                           native-vision model); change live with /umans-vision model <id>
+ *
+ * Client-side vision handoff: text-only ("via-handoff") Umans models can't see
+ * images, so attached images are analyzed with a native-vision Umans model and
+ * replaced in-message with `[Image analysis (image:ID)]: ...`. The analysis
+ * persists in the conversation (KV-cache friendly: not re-analyzed each turn),
+ * and the text model can call the `umans_vision` tool for targeted follow-ups.
  *
  * Models and capabilities are fetched live from /v1/models/info on extension
  * load. If the gateway is unreachable, a static fallback catalog is used so the
@@ -18,8 +27,10 @@
  *   UMANS_API_KEY=uk-... pi -e ~/.pi/agent/extensions/umans-provider
  *   # then /model umans/umans-coder
  */
+import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 
 type ReasoningInfo = {
   supported: boolean;
@@ -49,6 +60,16 @@ const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const API_KEY_ENV = "UMANS_API_KEY";
 const USER_AGENT = "pi-umans-provider/1.2.5";
 const STATUS_UPDATE_INTERVAL_MS = 1000;
+
+// Client-side vision handoff env + tuning. See header doc for the design.
+const VISION_DISABLE_ENV = "UMANS_VISION_DISABLE";
+const VISION_MODEL_ENV = "UMANS_VISION_MODEL";
+const VISION_MAX_TOKENS = 1024;
+const VISION_TIMEOUT_MS = 60_000;
+const VISION_ANALYSIS_PROMPT =
+  "You are a vision assistant for a text-only coding model. Analyze the attached image thoroughly but concisely. " +
+  "Capture: any visible text (verbatim), UI/layout, code/errors/stack traces, diagrams/charts, and other notable details. " +
+  "Write a compact structured report. Do not speculate beyond what is visible.";
 
 // Static fallback when /v1/models/info cannot be reached. Keep in sync with the
 // public model list from https://api.code.umans.ai/v1/models
@@ -258,6 +279,106 @@ async function fetchModelCatalog(
     clearTimeout(timer);
   }
 }
+
+export function isNativeVision(info: UmansModelInfo): boolean {
+  return !info.deprecation && info.capabilities?.supports_vision === true;
+}
+
+/**
+ * Pick the vision model used to analyze images for text-only (via-handoff)
+ * models. Honors UMANS_VISION_MODEL when it points at a native-vision model;
+ * otherwise defaults to umans-kimi-k2.7 (matching the gateway's "sends to
+ * kimi" handoff), falling back to the first native-vision model in the catalog.
+ */
+export function pickVisionModel(catalog: Record<string, UmansModelInfo>): string | undefined {
+  const configured = process.env[VISION_MODEL_ENV]?.trim();
+  if (configured && catalog[configured] && isNativeVision(catalog[configured])) {
+    return configured;
+  }
+  const defaultId = "umans-kimi-k2.7";
+  if (catalog[defaultId] && isNativeVision(catalog[defaultId])) return defaultId;
+  for (const [id, info] of Object.entries(catalog)) {
+    if (isNativeVision(info)) return id;
+  }
+  return undefined;
+}
+
+export function hashImageId(data: string): string {
+  return "img_" + createHash("sha256").update(data).digest("hex").slice(0, 8);
+}
+
+// Session-scoped cache of image bytes keyed by a content hash. Lets the
+// `umans_vision` tool re-query an image for targeted follow-ups without
+// re-sending it to the text model each turn. Cleared on session start/shutdown.
+// ponytail: in-memory only — lost on /reload or session switch; the persisted
+// analysis text still stands, only fresh follow-ups on old images become
+// unavailable until the image is re-attached.
+const imageStore = new Map<string, { data: string; mimeType: string }>();
+
+/**
+ * Call a native-vision Umans model with one image + a text prompt and return
+ * its text answer. Non-streaming, abort-aware (caller signal + hard timeout).
+ */
+async function analyzeImage(
+  apiKey: string,
+  model: string,
+  baseUrl: string,
+  image: { data: string; mimeType: string },
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), VISION_TIMEOUT_MS);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        Authorization: `Bearer ${apiKey}`,
+        "anthropic-version": "2023-06-01",
+        "User-Agent": USER_AGENT,
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: VISION_MAX_TOKENS,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "image",
+                source: { type: "base64", media_type: image.mimeType, data: image.data },
+              },
+            ],
+          },
+        ],
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status}${txt ? `: ${txt.slice(0, 200)}` : ""}`);
+    }
+    const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
+    const text = (data.content ?? [])
+      .filter((b) => b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text!)
+      .join("\n")
+      .trim();
+    return text || "(no analysis returned)";
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export default async function (pi: ExtensionAPI) {
   if (process.env.UMANS_DISABLE === "1") return;
 
@@ -498,7 +619,245 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
+  // === Client-side vision handoff (see module-level docs) ===
+  // Mutable at runtime via the /umans-vision command; env vars only seed the
+  // initial value (handy for headless/print mode). Read at call time by the
+  // message_end handler and the umans_vision tool so command changes apply
+  // immediately, without a /reload.
+  let visionDisabled = process.env[VISION_DISABLE_ENV] === "1";
+  let visionModelId = pickVisionModel(catalog);
+  const hasViaHandoffModel = Object.values(catalog).some(
+    (m) => !m.deprecation && m.capabilities?.supports_vision === "via-handoff",
+  );
+
+  function isViaHandoffUmans(modelId?: string): boolean {
+    if (!modelId) return false;
+    return catalog[modelId]?.capabilities?.supports_vision === "via-handoff";
+  }
+
+  function nativeVisionModelIds(): string[] {
+    return Object.entries(catalog)
+      .filter(([, info]) => isNativeVision(info))
+      .map(([id]) => id);
+  }
+
+  function setVisionStatus(ctx: any, text: string | undefined) {
+    try {
+      ctx?.ui?.setStatus("umans-vision", text);
+    } catch {
+      // UI not available (print/json mode) — ignore.
+    }
+  }
+
+  // Returns a copy of `message` with every image block replaced by an
+  // `[Image analysis (image:ID)]: ...` text block. Returns undefined when there
+  // are no images to transform. Image bytes are cached in `imageStore` keyed by
+  // a content hash so the `umans_vision` tool can re-query them later.
+  async function transformMessageImages(message: any, apiKey: string, ctx: any) {
+    const content = Array.isArray(message.content) ? message.content : null;
+    if (!content) return undefined;
+    const imageIndices: number[] = [];
+    for (let i = 0; i < content.length; i++) {
+      if (content[i]?.type === "image") imageIndices.push(i);
+    }
+    if (imageIndices.length === 0) return undefined;
+    if (!visionModelId) return undefined; // nothing to analyze with
+    const model = visionModelId;
+
+    setVisionStatus(
+      ctx,
+      `Umans vision: analyzing ${imageIndices.length} image${imageIndices.length > 1 ? "s" : ""}…`,
+    );
+    const replacements = new Map<number, { type: "text"; text: string }>();
+    await Promise.all(
+      imageIndices.map(async (i) => {
+        const img = content[i];
+        const id = hashImageId(img.data);
+        imageStore.set(id, { data: img.data, mimeType: img.mimeType });
+        let analysis: string;
+        try {
+          analysis = await analyzeImage(
+            apiKey,
+            model,
+            baseUrl,
+            { data: img.data, mimeType: img.mimeType },
+            VISION_ANALYSIS_PROMPT,
+          );
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          analysis = `analysis unavailable (${m}); call the umans_vision tool with image id ${id} to retry`;
+        }
+        replacements.set(i, {
+          type: "text",
+          text: `[Image analysis (image:${id})]: ${analysis}`,
+        });
+      }),
+    );
+    setVisionStatus(ctx, undefined);
+    const newContent = content.map((b: any, i: number) => replacements.get(i) ?? b);
+    return { ...message, content: newContent };
+  }
+
+  // The umans_vision follow-up tool + image interception register once (when
+  // the catalog has any via-handoff model) and read the live visionDisabled /
+  // visionModelId at call time, so /umans-vision can flip them without /reload.
+  if (hasViaHandoffModel) {
+    pi.registerTool({
+      name: "umans_vision",
+      label: "Umans Vision Follow-up",
+      description:
+        "Ask the Umans vision model a targeted question about an image that was summarized into an " +
+        "`[Image analysis (image:ID)]` block. Use when the initial summary omits a specific detail you " +
+        "need (text, region, color, layout). Pass the image ID from the block and your question.",
+      promptSnippet: "Ask the vision model a targeted follow-up about an analyzed image",
+      promptGuidelines: [
+        "Use umans_vision to ask a targeted follow-up about any `[Image analysis (image:ID)]` block " +
+          "when the initial summary lacks a specific detail you need (text, region, color, layout). " +
+          "Pass the image ID and your question.",
+      ],
+      parameters: Type.Object({
+        image_id: Type.String({
+          description: "Image ID from the `[Image analysis (image:ID)]` block",
+        }),
+        question: Type.String({
+          description: "The specific question to answer about the image",
+        }),
+      }),
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const image = imageStore.get(params.image_id);
+        if (!image) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Image ${params.image_id} is not available in this session ` +
+                  "(it predates the session or the session was reloaded). " +
+                  "Only the initial analysis in the conversation remains.",
+              },
+            ],
+            details: {},
+          };
+        }
+        const apiKey = await resolveApiKey(ctx);
+        if (!apiKey) {
+          return {
+            content: [{ type: "text", text: "Umans API key unavailable; cannot query the vision model." }],
+            details: {},
+          };
+        }
+        if (!visionModelId) {
+          return {
+            content: [{ type: "text", text: "No vision model configured. Set one with /umans-vision model <id>." }],
+            details: {},
+          };
+        }
+        const model = visionModelId;
+        try {
+          const answer = await analyzeImage(apiKey, model, baseUrl, image, params.question, signal);
+          return { content: [{ type: "text", text: answer }], details: {} };
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return { content: [{ type: "text", text: `Vision follow-up failed: ${m}` }], details: {} };
+        }
+      },
+    });
+
+    // Intercept images headed to a via-handoff (text-only) Umans model and
+    // replace them with persisted analysis text. Runs on the finalized user /
+    // toolResult message, before the first LLM `context` deep-copy, so the text
+    // model never sees the raw image and the analysis sticks in history.
+    pi.on("message_end", async (event, ctx) => {
+      if (ctx.model?.provider !== "umans") return;
+      if (!isViaHandoffUmans(ctx.model?.id)) return;
+      const msg = event.message as any;
+      if (msg.role !== "user" && msg.role !== "toolResult") return;
+      const content = msg.content;
+      if (!Array.isArray(content) || !content.some((b: any) => b?.type === "image")) return;
+      if (visionDisabled) return; // opted out via /umans-vision off → gateway-side handoff
+      if (!visionModelId) {
+        ctx.ui?.notify?.(
+          "Umans vision handoff skipped: no vision model. Run /umans-vision model <id>.",
+          "warning",
+        );
+        return;
+      }
+      const apiKey = await resolveApiKey(ctx);
+      // ponytail: no key — leave the image; the text-model call fails anyway.
+      if (!apiKey) return;
+      try {
+        const transformed = await transformMessageImages(msg, apiKey, ctx);
+        if (transformed) return { message: transformed };
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        ctx.ui?.notify?.(`Umans vision handoff failed: ${m}`, "error");
+      }
+    });
+
+    // /umans-vision: live control of the client-side handoff (replaces env vars
+    // for session-time use; env vars above still seed the initial value).
+    pi.registerCommand("umans-vision", {
+      description: "Umans vision handoff: show status, on/off, or pick the vision model",
+      getArgumentCompletions(prefix: string) {
+        const ids = nativeVisionModelIds();
+        if (prefix.startsWith("model")) {
+          const rest = prefix.slice("model".length).trimStart();
+          return ids
+            .filter((id) => id.startsWith(rest))
+            .map((value) => ({ value, label: value }));
+        }
+        return ["on", "off", "model"]
+          .filter((s) => s.startsWith(prefix.trimStart()))
+          .map((value) => ({ value, label: value }));
+      },
+      handler: async (args: string, ctx) => {
+        const parts = args.trim().split(/\s+/).filter(Boolean);
+        if (parts.length === 0) {
+          ctx.ui.notify(
+            `Umans vision: ${visionDisabled ? "off" : "on"} | model: ${visionModelId ?? "(none)"} | available: ${nativeVisionModelIds().join(", ") || "none"}`,
+            "info",
+          );
+          return;
+        }
+        const sub = parts[0];
+        if (sub === "on") {
+          visionDisabled = false;
+          ctx.ui.notify("Umans vision handoff enabled", "info");
+          return;
+        }
+        if (sub === "off") {
+          visionDisabled = true;
+          ctx.ui.notify("Umans vision handoff disabled (gateway-side fallback)", "info");
+          return;
+        }
+        if (sub === "model") {
+          const available = nativeVisionModelIds();
+          const id = parts[1];
+          if (!id) {
+            ctx.ui.notify(
+              `Vision model: ${visionModelId ?? "(none)"} | available: ${available.join(", ") || "none"}`,
+              "info",
+            );
+            return;
+          }
+          if (!available.includes(id)) {
+            ctx.ui.notify(
+              `Unknown vision model: ${id} | available: ${available.join(", ") || "none"}`,
+              "error",
+            );
+            return;
+          }
+          visionModelId = id;
+          ctx.ui.notify(`Vision model set to ${id}`, "info");
+          return;
+        }
+        ctx.ui.notify("Usage: /umans-vision [on|off|model [id]]", "info");
+      },
+    });
+  }
+
   pi.on("session_start", async (_event, ctx) => {
+    imageStore.clear();
     const apiKey = await resolveApiKey(ctx);
     if (ctx.model?.provider === "umans") {
       if (apiKey) await refreshUsage(apiKey);
@@ -590,6 +949,7 @@ export default async function (pi: ExtensionAPI) {
     activeTurns = 0;
     liveRequest = undefined;
     lastMetrics = {};
+    imageStore.clear();
     setWidget(ctx, undefined);
   });
 
