@@ -71,6 +71,10 @@ const VISION_ANALYSIS_PROMPT =
   "Capture: any visible text (verbatim), UI/layout, code/errors/stack traces, diagrams/charts, and other notable details. " +
   "Write a compact structured report. Do not speculate beyond what is visible.";
 
+// Web search side-call tuning. See searchWeb / the umans_web_search tool.
+const SEARCH_TIMEOUT_MS = 30_000;
+const SEARCH_MAX_TOKENS = 2048;
+
 // Static fallback when /v1/models/info cannot be reached. Keep in sync with the
 // public model list from https://api.code.umans.ai/v1/models
 const STATIC_CATALOG: Record<string, UmansModelInfo> = {
@@ -303,6 +307,19 @@ export function pickVisionModel(catalog: Record<string, UmansModelInfo>): string
   return undefined;
 }
 
+/**
+ * Pick the model used to run the side-call web search. Defaults to umans-flash
+ * (fastest); falls back to the first tool-capable model if flash is absent.
+ */
+export function pickSearchModel(catalog: Record<string, UmansModelInfo>): string {
+  const defaultId = "umans-flash";
+  if (catalog[defaultId] && !catalog[defaultId].deprecation) return defaultId;
+  for (const [id, info] of Object.entries(catalog)) {
+    if (!info.deprecation && info.capabilities?.supports_tools) return id;
+  }
+  return defaultId;
+}
+
 export function hashImageId(data: string): string {
   return "img_" + createHash("sha256").update(data).digest("hex").slice(0, 8);
 }
@@ -373,6 +390,90 @@ async function analyzeImage(
       .join("\n")
       .trim();
     return text || "(no analysis returned)";
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
+ * Run a web search by making a sub-request to the Umans gateway with the
+ * Anthropic `web_search_20250305` server tool declared. The gateway runs the
+ * Exa search server-side and returns results; we surface the model's formatted
+ * result text (titles, URLs, snippets) back to the calling model.
+ *
+ * Side-call because pi-ai only serializes client-side tools and cannot emit the
+ * server-tool shape the gateway requires (see header doc). Costs one extra
+ * round-trip per search; no pi-ai changes needed.
+ */
+async function searchWeb(
+  apiKey: string,
+  model: string,
+  baseUrl: string,
+  query: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), SEARCH_TIMEOUT_MS);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        Authorization: `Bearer ${apiKey}`,
+        "anthropic-version": "2023-06-01",
+        "User-Agent": USER_AGENT,
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: SEARCH_MAX_TOKENS,
+        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
+        messages: [
+          {
+            role: "user",
+            content:
+              "Search the web for the query below and return a concise list of the most relevant results. " +
+              "For each result give: title, URL, and a short snippet of the key facts. " +
+              "Do not answer beyond what the sources say.\n\nQuery: " +
+              query,
+          },
+        ],
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status}${txt ? `: ${txt.slice(0, 200)}` : ""}`);
+    }
+    const data = (await res.json()) as {
+      content?: Array<{
+        type: string;
+        text?: string;
+        content?: Array<{ url?: string; title?: string }>;
+      }>;
+    };
+    const blocks = data.content ?? [];
+    const text = blocks
+      .filter((b) => b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text!)
+      .join("\n")
+      .trim();
+    if (text) return text;
+    // No synthesized text — fall back to the raw result list.
+    const results =
+      blocks.find((b) => b.type === "web_search_tool_result")?.content ?? [];
+    if (results.length) {
+      return results
+        .map((r, i) => `${i + 1}. ${r.title ?? ""}\n   URL: ${r.url ?? ""}`)
+        .join("\n");
+    }
+    return "(no search results returned)";
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener("abort", onAbort);
@@ -613,6 +714,47 @@ export default async function (pi: ExtensionAPI) {
       return undefined;
     }
   }
+
+  // === Web search (reuses the gateway's built-in Exa via a side-call) ===
+  // The Umans gateway runs web search through Exa, but only when the request
+  // declares the Anthropic `web_search_20250305` server tool — which pi-ai
+  // cannot send (it only serializes client-side tools). So we expose a normal
+  // client-side tool: the main model calls it, we make a sub-request that does
+  // declare the server tool, and return the results. One extra round-trip per
+  // search; no pi-ai changes required.
+  const searchModelId = pickSearchModel(catalog);
+  pi.registerTool({
+    name: "umans_web_search",
+    label: "Umans Web Search",
+    description:
+      "Search the web (via the Umans gateway's built-in Exa) for current or real-time information " +
+      "you do not already have: recent events, live prices, latest library/SDK versions, current docs, " +
+      "or date-sensitive facts. Pass a focused search query.",
+    promptSnippet: "Search the web for current information",
+    promptGuidelines: [
+      "Use umans_web_search for current or real-time information you do not already have: recent events, live prices, latest library versions, current docs, or date-sensitive facts. Pass a focused query.",
+      "Do not use it for things you already know or can derive from the codebase.",
+    ],
+    parameters: Type.Object({
+      query: Type.String({ description: "The web search query" }),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const apiKey = await resolveApiKey(ctx);
+      if (!apiKey) {
+        return {
+          content: [{ type: "text", text: "Umans API key unavailable; cannot run web search." }],
+          details: {},
+        };
+      }
+      try {
+        const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal);
+        return { content: [{ type: "text", text: results }], details: {} };
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text", text: `Web search failed: ${m}` }], details: {} };
+      }
+    },
+  });
 
   // === Client-side vision handoff (see module-level docs) ===
   // Mutable at runtime via the /umans-vision command; env vars only seed the
