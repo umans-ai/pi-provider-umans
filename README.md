@@ -52,8 +52,7 @@ Current catalog:
 |---|---|---|---|---|
 | `umans-kimi-k2.6` | Umans Kimi K2.6 | native | ✅ | 256K |
 | `umans-kimi-k2.7` | Umans Kimi K2.7 Code | native | ✅ (always on) | 256K |
-| `umans-glm-5.1` | Umans GLM 5.1 | via-handoff | ✅ | 198K |
-| `umans-glm-5.2` | Umans GLM 5.2 | via-handoff | ✅ | 396K |
+| `umans-glm-5.2` | Umans GLM 5.2 | via-handoff | ✅ | 406K |
 | `umans-coder` | Umans Coder | native | ✅ (always on) | 256K |
 | `umans-flash` | Umans Flash | native | ✅ | 256K |
 | `umans-qwen3.6-35b-a3b` | Umans Qwen3.6 35B A3B | native | ✅ | 256K |
