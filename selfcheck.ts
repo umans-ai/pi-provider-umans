@@ -3,7 +3,7 @@
 // hashing. Does NOT cover the network path (analyzeImage) — that's integration.
 //
 // Run: bun selfcheck.ts
-import { isNativeVision, pickVisionModel, hashImageId } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, stripClientWebSearchTool } from "./index.ts";
 
 function vision(
   name: string,
@@ -62,5 +62,29 @@ const a = hashImageId("data-a");
 assert(a === hashImageId("data-a"), "hash is deterministic");
 assert(a !== hashImageId("data-b"), "hash differs for different images");
 assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
+
+// --- stripClientWebSearchTool: drop client `web_search`, keep the rest ---
+// Regression guard for the umans-gateway echo bug: the gateway auto-promotes
+// any client tool named `web_search` into a server-side Exa search on every
+// turn (last user message = query), corrupting the reply. pi-web-access
+// registers exactly such a tool.
+const TOOLS = [
+  { name: "read" },
+  { name: "web_search", description: "pi-web-access client tool" },
+  { name: "umans_web_search" },
+  { name: "fetch_content" },
+];
+const stripped = stripClientWebSearchTool(TOOLS);
+assert(stripped.length === 3, "removes the single client web_search tool");
+assert(!stripped.some((t) => t.name === "web_search"), "no web_search survives");
+assert(stripped.some((t) => t.name === "umans_web_search"), "keeps umans_web_search");
+assert(stripped.some((t) => t.name === "fetch_content"), "keeps unrelated tools");
+assert(stripClientWebSearchTool([{ name: "read" }, { name: "bash" }]).length === 2, "no-op when web_search absent");
+assert(stripClientWebSearchTool([]).length === 0, "empty in, empty out");
+// An explicit server tool (type web_search_20250305) is preserved on purpose.
+const SERVER = [{ type: "web_search_20250305", name: "web_search" }];
+assert(stripClientWebSearchTool(SERVER).length === 1, "keeps explicit server web_search_20250305");
+// Untouched when only same-named-but-different-type tools exist.
+assert(stripClientWebSearchTool([{ name: "web_search_exa" }]).length === 1, "leaves web_search_exa alone");
 
 console.log("\nall checks passed");
