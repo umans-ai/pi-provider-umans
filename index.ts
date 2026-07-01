@@ -324,6 +324,35 @@ export function hashImageId(data: string): string {
   return "img_" + createHash("sha256").update(data).digest("hex").slice(0, 8);
 }
 
+/**
+ * Remove a client-side `web_search` tool from a request's tool list.
+ *
+ * The Umans gateway auto-promotes ANY client tool *named* `web_search` into a
+ * server-side Anthropic `web_search_20250305` + Exa grounding pass — on every
+ * turn, using the last user message as the query — and returns the results as
+ * a `web_search_tool_result` the model renders verbatim as `[Web search
+ * results]…`. This hijacks the entire reply (e.g. the prompt `hello` becomes a
+ * web search for "hello"). Promotion keys off the tool NAME only; the tool's
+ * description is irrelevant (verified by renaming → clean).
+ *
+ * pi-web-access registers exactly such a client tool, so when it is loaded
+ * alongside this provider every Umans turn is corrupted. Since this provider
+ * already offers `umans_web_search` (the intended side-call path), the
+ * `web_search` client tool is redundant for Umans and is stripped before the
+ * request leaves pi. An explicitly-declared server tool
+ * (`type: "web_search_20250305"`) is preserved in case a caller wants the
+ * gateway's native grounding on purpose.
+ *
+ * Pure/exported so selfcheck.ts can cover it without the network.
+ */
+export function stripClientWebSearchTool<
+  T extends { name?: string; type?: string },
+>(tools: T[]): T[] {
+  return tools.filter(
+    (t) => !(t.name === "web_search" && t.type !== "web_search_20250305"),
+  );
+}
+
 // Session-scoped cache of image bytes keyed by a content hash. Lets the
 // `umans_vision` tool re-query an image for targeted follow-ups without
 // re-sending it to the text model each turn. Cleared on session start/shutdown.
@@ -715,13 +744,35 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
+  // Strip the pi-web-access `web_search` client tool from outgoing Umans
+  // requests. The gateway promotes any client tool *named* `web_search` into a
+  // server-side `web_search_20250305` + Exa pass on every turn (not only when
+  // the server tool is declared, as documented below), hijacking the reply into
+  // a `[Web search results]` dump — see stripClientWebSearchTool. Scoped to
+  // Umans so other providers keep their `web_search`; `umans_web_search`
+  // remains the web-search path here.
+  pi.on("before_provider_request", (event: any, ctx: any) => {
+    try {
+      if (ctx?.model?.provider !== "umans") return;
+      const payload = event?.payload;
+      const tools = payload?.tools;
+      if (!Array.isArray(tools) || tools.length === 0) return;
+      const filtered = stripClientWebSearchTool(tools);
+      if (filtered.length === tools.length) return;
+      return { ...payload, tools: filtered };
+    } catch {
+      // best effort — never block the request
+    }
+  });
+
   // === Web search (reuses the gateway's built-in Exa via a side-call) ===
-  // The Umans gateway runs web search through Exa, but only when the request
-  // declares the Anthropic `web_search_20250305` server tool — which pi-ai
-  // cannot send (it only serializes client-side tools). So we expose a normal
-  // client-side tool: the main model calls it, we make a sub-request that does
-  // declare the server tool, and return the results. One extra round-trip per
-  // search; no pi-ai changes required.
+  // The Umans gateway runs web search through Exa when the request declares
+  // the Anthropic `web_search_20250305` server tool — which pi-ai cannot send
+  // (it only serializes client-side tools). NOTE: the gateway *also* promotes
+  // any client tool named `web_search` (see the hook above), which is why we
+  // strip that name. So we expose a normal client-side tool: the main model
+  // calls it, we make a sub-request that does declare the server tool, and
+  // return the results. One extra round-trip per search; no pi-ai changes.
   const searchModelId = pickSearchModel(catalog);
   pi.registerTool({
     name: "umans_web_search",
