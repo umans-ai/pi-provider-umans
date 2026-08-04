@@ -50,6 +50,7 @@ Current catalog:
 
 | ID | Name | Vision | Reasoning | Context |
 |---|---|---|---|---|
+| `umans-deepseek-v4-flash-0731` | Umans DeepSeek V4 Flash | text only | ✅ (low default) | 1M |
 | `umans-kimi-k2.6` | Umans Kimi K2.6 | native | ✅ | 256K |
 | `umans-kimi-k2.7` | Umans Kimi K2.7 Code | native | ✅ (always on) | 256K |
 | `umans-glm-5.2` | Umans GLM 5.2 | via-handoff | ✅ | 406K |

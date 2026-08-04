@@ -141,6 +141,23 @@ const STATIC_CATALOG: Record<string, UmansModelInfo> = {
       },
     },
   },
+  "umans-deepseek-v4-flash-0731": {
+    name: "umans-deepseek-v4-flash-0731",
+    display_name: "Umans DeepSeek V4 Flash",
+    capabilities: {
+      max_completion_tokens: 393216,
+      recommended_max_tokens: 393215,
+      context_window: 1048576,
+      supports_vision: false,
+      supports_tools: true,
+      reasoning: {
+        supported: true,
+        can_disable: true,
+        levels: ["none", "low", "high", "max"],
+        default_level: "low",
+      },
+    },
+  },
   "umans-glm-5.2": {
     name: "umans-glm-5.2",
     display_name: "Umans GLM 5.2",
